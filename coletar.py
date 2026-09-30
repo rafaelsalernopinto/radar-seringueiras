@@ -4,8 +4,10 @@ Coleta empresas de seringueira e eucalipto com telefone DDD 17 (SP)
 na base aberta de CNPJ da Receita Federal. Gera um painel (HTML) e uma
 planilha (Excel) e envia os dois para o Telegram.
 """
+import base64
 import csv
 import datetime
+import gzip
 import html
 import json
 import os
@@ -26,6 +28,15 @@ try:
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "duckdb"])
     import duckdb
+try:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "cryptography"])
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from openpyxl.styles import Font, PatternFill
 
 # ================== CONFIGURAÇÃO (pode editar) ==================
@@ -41,6 +52,8 @@ APENAS_ATIVAS = True
 MODO_TESTE = os.getenv("MODO_TESTE", "false").lower() == "true"
 TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+SENHA = os.getenv("PAINEL_SENHA", "").strip()
+REPO = os.getenv("GITHUB_REPOSITORY", "")
 
 # Espelho público da base da Receita no Hugging Face (CNPJ Aberto), um conjunto por mês
 HF_BASE = os.getenv("HF_BASE", "https://huggingface.co/datasets")
@@ -49,6 +62,7 @@ HF_PREFIXO = "cnpj-dados-receita-brasil-"
 
 TRAB = Path("trabalho")
 SAIDA = Path("saida")
+SITE = Path("site")
 HIST = Path("historico/cnpjs.txt")
 
 S = requests.Session()
@@ -355,11 +369,30 @@ def gerar_excel(leads, caminho):
     wb.save(caminho)
 
 
+def cifrar(conteudo, senha):
+    """gzip + AES-256-GCM com chave derivada da senha (PBKDF2-SHA256). Aberto no navegador via Web Crypto."""
+    sal, iv, voltas = os.urandom(16), os.urandom(12), 250_000
+    chave = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=sal, iterations=voltas).derive(senha.encode("utf-8"))
+    cifrado = AESGCM(chave).encrypt(iv, gzip.compress(conteudo, 9), None)
+    b64 = lambda x: base64.b64encode(x).decode("ascii")
+    return {"s": b64(sal), "i": b64(iv), "c": b64(cifrado), "n": voltas}
+
+
 def gerar_painel(leads, mes, caminho):
+    if not SENHA:
+        raise RuntimeError("Falta o secret PAINEL_SENHA no GitHub (a senha do painel).")
     info = {"mes": mes, "gerado": datetime.datetime.now().strftime("%d/%m/%Y"), "teste": MODO_TESTE}
-    dados = json.dumps(leads, ensure_ascii=False).replace("</", "<\\/")
-    pagina = PAINEL.replace("__DADOS__", dados).replace("__INFO__", json.dumps(info, ensure_ascii=False))
+    pacote = cifrar(json.dumps(leads, ensure_ascii=False).encode("utf-8"), SENHA)
+    pagina = PAINEL.replace("__PACOTE__", json.dumps(pacote)).replace("__INFO__", json.dumps(info, ensure_ascii=False))
+    caminho.parent.mkdir(exist_ok=True)
     caminho.write_text(pagina, encoding="utf-8")
+
+
+def link_painel():
+    if "/" not in REPO:
+        return ""
+    dono, nome = REPO.split("/", 1)
+    return f"https://{dono.lower()}.github.io/{nome}/"
 
 
 def main():
@@ -370,7 +403,7 @@ def main():
         mes, leads = coletar()
     primeira = marcar_novos(leads)
 
-    painel = SAIDA / "painel.html"
+    painel = SITE / "index.html"
     planilha = SAIDA / f"produtores_ddd17_{mes}.xlsx"
     gerar_painel(leads, mes, painel)
     gerar_excel(leads, planilha)
@@ -385,11 +418,14 @@ def main():
         f"Base da Receita: {html.escape(mes)}\n"
         f"Seringueira: <b>{ser}</b>   Eucalipto: <b>{euc}</b>\n"
         f"Total: <b>{len(leads)}</b> empresas. {linha_novos}\n\n"
-        "Abra o <b>painel.html</b> abaixo para filtrar e chamar no WhatsApp."
     )
+    link = link_painel()
+    if MODO_TESTE:
+        texto += "No modo teste o painel online não é atualizado."
+    elif link:
+        texto += f"📊 Painel (fica pronto em 1 a 2 minutos):\n{link}"
     log(texto.replace("<b>", "").replace("</b>", ""))
     enviar_msg(texto)
-    enviar_arquivo(painel, "Painel: toque para abrir no navegador")
     enviar_arquivo(planilha, "Planilha completa (coluna de hectares para preencher)")
 
 
@@ -418,6 +454,7 @@ PAINEL = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
 <title>Produtores DDD 17</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Sans+3:wght@400;600&display=swap" rel="stylesheet">
@@ -435,6 +472,15 @@ PAINEL = r"""<!doctype html>
   --ser:#72B38F; --euc:#8FC3C8; --amb:#D58C69; --novo:#EB7F63;
 }}
 *,*::before,*::after{box-sizing:inherit}
+[hidden]{display:none!important}
+.cadeado{max-width:420px}
+.cadeado input[type=password]{width:100%;font:inherit;color:inherit;background:var(--sup);border:1px solid var(--linha);border-radius:10px;padding:12px 14px;margin:6px 0 12px}
+.cadeado .check{margin-bottom:4px}
+.abrir{display:block;width:100%;margin-top:14px;font:600 17px var(--texto);padding:13px;border-radius:10px;border:0;background:var(--ser);color:#fff;cursor:pointer}
+.abrir:disabled{opacity:.6}
+@media (prefers-color-scheme: dark){.abrir{color:#0F1512}}
+.erro{color:var(--novo);min-height:1.5em;margin:10px 0 0;font-size:15px}
+.sair{background:none;border:0;padding:0;color:var(--suave);text-decoration:underline;font:inherit;font-size:13px;cursor:pointer;margin-top:8px}
 html{scroll-padding-top:env(safe-area-inset-top,0px)}
 body{margin:0;background:var(--fundo);color:var(--tinta);font:16px/1.5 var(--texto)}
 .wrap{max-width:720px;margin:0 auto;padding:28px 18px 60px}
@@ -479,6 +525,18 @@ footer{margin-top:28px;color:var(--suave);font-size:13px}
 </head>
 <body>
 <div class="wrap">
+  <section class="cadeado" id="cadeado">
+    <h1>Seringueira e eucalipto no DDD 17</h1>
+    <p class="meta">Digite a senha do painel para ver os produtores.</p>
+    <form id="form-senha">
+      <input type="password" id="senha" autocomplete="current-password" placeholder="Senha" aria-label="Senha" required>
+      <label class="check"><input type="checkbox" id="lembrar" checked> Lembrar neste aparelho</label>
+      <button type="submit" class="abrir" id="abrir">Abrir painel</button>
+      <p class="erro" id="erro" role="alert"></p>
+    </form>
+  </section>
+
+  <div id="app" hidden>
   <header>
     <div id="aviso"></div>
     <h1>Seringueira e eucalipto no DDD 17</h1>
@@ -501,12 +559,15 @@ footer{margin-top:28px;color:var(--suave);font-size:13px}
   <button class="mais" id="mais" hidden>Mostrar mais</button>
   <button class="exportar" id="exportar">Baixar esta lista em CSV</button>
 
-  <footer>Dados públicos do CNPJ (Receita Federal). Só aparecem produtores com CNPJ; quem planta como pessoa física sem CNPJ não está aqui. Ao entrar em contato, apresente-se e respeite quem pedir para não ser procurado (LGPD).</footer>
+  <footer>Dados públicos do CNPJ (Receita Federal). Só aparecem produtores com CNPJ; quem planta como pessoa física sem CNPJ não está aqui. Ao entrar em contato, apresente-se e respeite quem pedir para não ser procurado (LGPD).<br><button class="sair" id="sair">Esquecer a senha neste aparelho</button></footer>
+  </div>
 </div>
 
 <script>
-const DADOS = __DADOS__;
+const PACOTE = __PACOTE__;
 const INFO = __INFO__;
+
+function iniciar(DADOS) {
 const COR = {ser:"var(--ser)", euc:"var(--euc)", amb:"var(--amb)"};
 const ROTULO = {ser:"Só seringueira", euc:"Só eucalipto", amb:"As duas"};
 const f = {texto:"", grupo:"", cidade:"", cel:false, novos:false};
@@ -606,6 +667,54 @@ $("exportar").onclick = () => {
   a.href = URL.createObjectURL(blob); a.download = "produtores_ddd17.csv"; a.click();
 };
 render(true);
+}
+
+const LEMBRAR = "painel-ddd17-senha";
+const bytes = t => Uint8Array.from(atob(t), c => c.charCodeAt(0));
+
+async function abrirPacote(senha) {
+  const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(senha), "PBKDF2", false, ["deriveKey"]);
+  const chave = await crypto.subtle.deriveKey(
+    {name: "PBKDF2", salt: bytes(PACOTE.s), iterations: PACOTE.n, hash: "SHA-256"},
+    base, {name: "AES-GCM", length: 256}, false, ["decrypt"]);
+  const claro = await crypto.subtle.decrypt({name: "AES-GCM", iv: bytes(PACOTE.i)}, chave, bytes(PACOTE.c));
+  const fluxo = new Blob([claro]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return JSON.parse(await new Response(fluxo).text());
+}
+
+async function tentar(senha, lembrar) {
+  const erro = document.getElementById("erro"), botao = document.getElementById("abrir");
+  botao.disabled = true; botao.textContent = "Abrindo..."; erro.textContent = "";
+  try {
+    const dados = await abrirPacote(senha.trim());
+    try { lembrar ? localStorage.setItem(LEMBRAR, senha.trim()) : localStorage.removeItem(LEMBRAR); } catch (e) {}
+    document.getElementById("cadeado").hidden = true;
+    document.getElementById("app").hidden = false;
+    iniciar(dados);
+  } catch (e) {
+    try { localStorage.removeItem(LEMBRAR); } catch (_) {}
+    erro.textContent = e && e.name === "OperationError"
+      ? "Senha incorreta. Confira e tente de novo."
+      : "Este navegador não conseguiu abrir o painel. Abra o link no Safari ou no Chrome.";
+    botao.disabled = false; botao.textContent = "Abrir painel";
+  }
+}
+
+document.getElementById("form-senha").addEventListener("submit", e => {
+  e.preventDefault();
+  tentar(document.getElementById("senha").value, document.getElementById("lembrar").checked);
+});
+document.getElementById("sair").addEventListener("click", () => {
+  try { localStorage.removeItem(LEMBRAR); } catch (e) {}
+  location.reload();
+});
+if (!window.crypto || !crypto.subtle || typeof DecompressionStream === "undefined") {
+  document.getElementById("erro").textContent = "Abra este link no Safari ou no Chrome (o visualizador de arquivos não roda o painel).";
+} else {
+  let salva = null;
+  try { salva = localStorage.getItem(LEMBRAR); } catch (e) {}
+  if (salva) tentar(salva, true);
+}
 </script>
 </body>
 </html>
