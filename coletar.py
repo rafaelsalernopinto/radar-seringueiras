@@ -36,8 +36,8 @@ TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 RF_HOST = "https://arquivos.receitafederal.gov.br"
-RF_SHARE = os.getenv("RF_SHARE", "gn672Ad4CF8N6TK")
-RF_PASTA = os.getenv("RF_PASTA", "/Dados/Cadastros/CNPJ")
+# Códigos da pasta compartilhada da Receita (o primeiro é o atual; os outros são reserva)
+RF_SHARES = [x for x in os.getenv("RF_SHARE", "YggdBLfdninEJX9,gn672Ad4CF8N6TK").split(",") if x]
 RF_LEGADO = os.getenv("RF_URL_BASE", "https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/")
 
 TRAB = Path("trabalho")
@@ -85,48 +85,73 @@ def enviar_arquivo(caminho, legenda=""):
 
 
 # ---------------------------------------------------------------- Receita
-def _hrefs(xml):
-    achados = re.findall(r"<(?:\w+:)?href>([^<]+)</(?:\w+:)?href>", xml, re.I)
-    return [requests.utils.unquote(h).rstrip("/").split("/")[-1] for h in achados][1:]
+PROBLEMAS = []
 
 
-def _variantes(caminho):
+def _variantes(share, caminho):
     """Formas conhecidas de acessar a pasta compartilhada da Receita (Nextcloud)."""
     return [
-        ("webdav", f"{RF_HOST}/public.php/webdav{caminho}", (RF_SHARE, "")),
-        ("dav", f"{RF_HOST}/public.php/dav/files/{RF_SHARE}{caminho}", None),
+        ("webdav", f"{RF_HOST}/public.php/webdav{caminho}", (share, "")),
+        ("dav", f"{RF_HOST}/public.php/dav/files/{share}{caminho}", None),
     ]
 
 
-def listar(caminho, preferida=None):
-    for nome, url, auth in _variantes(caminho):
-        if preferida and nome != preferida:
+def _itens(xml, caminho):
+    """Lê a resposta PROPFIND e devolve [(nome, é_pasta)] sem a própria pasta."""
+    itens = []
+    for bloco in re.findall(r"<(?:\w+:)?response>(.*?)</(?:\w+:)?response>", xml, re.S | re.I):
+        h = re.search(r"<(?:\w+:)?href>([^<]+)</(?:\w+:)?href>", bloco, re.I)
+        if not h:
+            continue
+        nome = requests.utils.unquote(h.group(1)).rstrip("/").split("/")[-1]
+        pasta = bool(re.search(r"<(?:\w+:)?collection\s*/?>", bloco, re.I))
+        if nome and nome != caminho.rstrip("/").split("/")[-1]:
+            itens.append((nome, pasta))
+    return itens
+
+
+def listar(share, caminho, variante=None):
+    for nome, url, auth in _variantes(share, caminho):
+        if variante and nome != variante:
             continue
         try:
             r = S.request("PROPFIND", url, auth=auth, headers={"Depth": "1"}, timeout=90)
             if r.status_code in (200, 207):
-                return nome, _hrefs(r.text)
+                return nome, _itens(r.text, caminho)
+            PROBLEMAS.append(f"{nome} {caminho or '/'}: HTTP {r.status_code}")
         except Exception as e:
-            log(f"  {nome}: {e}")
+            PROBLEMAS.append(f"{nome} {caminho or '/'}: {type(e).__name__}")
     return None, []
 
 
 def achar_fonte():
-    base = RF_PASTA
-    for _ in range(3):
-        variante, itens = listar(base)
-        if not itens:
-            break
-        meses = sorted((n for n in itens if re.fullmatch(r"\d{4}-\d{2}", n)), reverse=True)
-        for mes in meses[:3]:
-            pasta = f"{base}/{mes}"
-            _, arquivos = listar(pasta, variante)
-            if any(a.startswith("Estabelecimentos") for a in arquivos):
-                return {"tipo": variante, "pasta": pasta, "mes": mes}
-        sub = [n for n in itens if "dados_abertos" in n.lower()]
-        if not sub:
-            break
-        base = f"{base}/{sub[0]}"
+    prioridade = ("dados", "cadastros", "cnpj", "dados_abertos_cnpj")
+    for share in RF_SHARES:
+        log(f"Procurando na pasta compartilhada {share}...")
+        variante, raiz = listar(share, "")
+        if not variante:
+            continue
+        fila, vistos = [("", raiz, 0)], set()
+        while fila:
+            caminho, itens, prof = fila.pop(0)
+            meses = sorted((n for n, p in itens if p and re.fullmatch(r"\d{4}-\d{2}", n)), reverse=True)
+            for mes in meses[:3]:
+                pasta = f"{caminho}/{mes}"
+                _, arquivos = listar(share, pasta, variante)
+                if any(n.lower().startswith("estabelecimentos") for n, _ in arquivos):
+                    log(f"Encontrei: {pasta}")
+                    return {"tipo": variante, "share": share, "pasta": pasta, "mes": mes}
+            if prof >= 4:
+                continue
+            subpastas = [n for n, p in itens if p and not re.fullmatch(r"\d{4}-\d{2}", n)]
+            subpastas.sort(key=lambda n: (n.lower() not in prioridade, n.lower()))
+            for n in subpastas[:8]:
+                sub = f"{caminho}/{n}"
+                if sub in vistos:
+                    continue
+                vistos.add(sub)
+                _, filhos = listar(share, sub, variante)
+                fila.append((sub, filhos, prof + 1))
 
     try:
         r = S.get(RF_LEGADO, timeout=90)
@@ -135,14 +160,15 @@ def achar_fonte():
         if meses:
             return {"tipo": "http", "pasta": RF_LEGADO.rstrip("/") + "/" + meses[-1], "mes": meses[-1]}
     except Exception as e:
-        log(f"Endereço antigo indisponível: {e}")
-    raise RuntimeError("Não encontrei os arquivos da Receita. O site pode estar fora do ar ou ter mudado de endereço.")
+        PROBLEMAS.append(f"endereço antigo: {type(e).__name__}")
+    detalhes = "; ".join(PROBLEMAS[:6]) or "sem resposta"
+    raise RuntimeError(f"Não encontrei os arquivos da Receita ({detalhes}).")
 
 
 def url_arquivo(fonte, nome):
     if fonte["tipo"] == "http":
         return f"{fonte['pasta']}/{nome}", None
-    for variante, url, auth in _variantes(f"{fonte['pasta']}/{nome}"):
+    for variante, url, auth in _variantes(fonte["share"], f"{fonte['pasta']}/{nome}"):
         if variante == fonte["tipo"]:
             return url, auth
 
