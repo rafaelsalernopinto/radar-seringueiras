@@ -12,13 +12,20 @@ import os
 import re
 import sys
 import time
-import zipfile
 from collections import defaultdict
 from pathlib import Path
 from urllib.parse import quote
 
+import subprocess
+
 import requests
 from openpyxl import Workbook
+
+try:
+    import duckdb
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "duckdb"])
+    import duckdb
 from openpyxl.styles import Font, PatternFill
 
 # ================== CONFIGURAÇÃO (pode editar) ==================
@@ -35,10 +42,10 @@ MODO_TESTE = os.getenv("MODO_TESTE", "false").lower() == "true"
 TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-RF_HOST = "https://arquivos.receitafederal.gov.br"
-# Códigos da pasta compartilhada da Receita (o primeiro é o atual; os outros são reserva)
-RF_SHARES = [x for x in os.getenv("RF_SHARE", "YggdBLfdninEJX9,gn672Ad4CF8N6TK").split(",") if x]
-RF_LEGADO = os.getenv("RF_URL_BASE", "https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/")
+# Espelho público da base da Receita no Hugging Face (CNPJ Aberto), um conjunto por mês
+HF_BASE = os.getenv("HF_BASE", "https://huggingface.co/datasets")
+HF_USER = os.getenv("HF_USER", "cnpjaberto")
+HF_PREFIXO = "cnpj-dados-receita-brasil-"
 
 TRAB = Path("trabalho")
 SAIDA = Path("saida")
@@ -84,142 +91,103 @@ def enviar_arquivo(caminho, legenda=""):
                  files={"document": (caminho.name, f)})
 
 
-# ---------------------------------------------------------------- Receita
+# ---------------------------------------------------------------- Fonte dos dados
 PROBLEMAS = []
+CON = duckdb.connect()
 
 
-def _variantes(share, caminho):
-    """Formas conhecidas de acessar a pasta compartilhada da Receita (Nextcloud)."""
-    return [
-        ("webdav", f"{RF_HOST}/public.php/webdav{caminho}", (share, "")),
-        ("dav", f"{RF_HOST}/public.php/dav/files/{share}{caminho}", None),
-    ]
-
-
-def _itens(xml, caminho):
-    """Lê a resposta PROPFIND e devolve [(nome, é_pasta)] sem a própria pasta."""
-    itens = []
-    for bloco in re.findall(r"<(?:\w+:)?response>(.*?)</(?:\w+:)?response>", xml, re.S | re.I):
-        h = re.search(r"<(?:\w+:)?href>([^<]+)</(?:\w+:)?href>", bloco, re.I)
-        if not h:
-            continue
-        nome = requests.utils.unquote(h.group(1)).rstrip("/").split("/")[-1]
-        pasta = bool(re.search(r"<(?:\w+:)?collection\s*/?>", bloco, re.I))
-        if nome and nome != caminho.rstrip("/").split("/")[-1]:
-            itens.append((nome, pasta))
-    return itens
-
-
-def listar(share, caminho, variante=None):
-    for nome, url, auth in _variantes(share, caminho):
-        if variante and nome != variante:
-            continue
+def achar_edicao():
+    """Procura o mês mais recente publicado no espelho (mês atual e até 5 anteriores)."""
+    hoje = datetime.date.today()
+    ano, mes = hoje.year, hoje.month
+    for _ in range(6):
+        repo = f"{HF_PREFIXO}{ano:04d}-{mes:02d}"
+        url = f"{HF_BASE}/{HF_USER}/{repo}/resolve/main/_manifest.json"
         try:
-            r = S.request("PROPFIND", url, auth=auth, headers={"Depth": "1"}, timeout=90)
-            if r.status_code in (200, 207):
-                return nome, _itens(r.text, caminho)
-            PROBLEMAS.append(f"{nome} {caminho or '/'}: HTTP {r.status_code}")
+            r = S.get(url, timeout=60)
+            if r.ok:
+                manifesto = r.json()
+                if manifesto.get("files"):
+                    return repo, manifesto
+            PROBLEMAS.append(f"{ano:04d}-{mes:02d}: HTTP {r.status_code}")
         except Exception as e:
-            PROBLEMAS.append(f"{nome} {caminho or '/'}: {type(e).__name__}")
-    return None, []
+            PROBLEMAS.append(f"{ano:04d}-{mes:02d}: {type(e).__name__}")
+        mes -= 1
+        if mes == 0:
+            ano, mes = ano - 1, 12
+    raise RuntimeError("Não encontrei a base no espelho (" + "; ".join(PROBLEMAS[:6]) + ").")
 
 
-def achar_fonte():
-    prioridade = ("dados", "cadastros", "cnpj", "dados_abertos_cnpj")
-    for share in RF_SHARES:
-        log(f"Procurando na pasta compartilhada {share}...")
-        variante, raiz = listar(share, "")
-        if not variante:
-            continue
-        fila, vistos = [("", raiz, 0)], set()
-        while fila:
-            caminho, itens, prof = fila.pop(0)
-            meses = sorted((n for n, p in itens if p and re.fullmatch(r"\d{4}-\d{2}", n)), reverse=True)
-            for mes in meses[:3]:
-                pasta = f"{caminho}/{mes}"
-                _, arquivos = listar(share, pasta, variante)
-                if any(n.lower().startswith("estabelecimentos") for n, _ in arquivos):
-                    log(f"Encontrei: {pasta}")
-                    return {"tipo": variante, "share": share, "pasta": pasta, "mes": mes}
-            if prof >= 4:
-                continue
-            subpastas = [n for n, p in itens if p and not re.fullmatch(r"\d{4}-\d{2}", n)]
-            subpastas.sort(key=lambda n: (n.lower() not in prioridade, n.lower()))
-            for n in subpastas[:8]:
-                sub = f"{caminho}/{n}"
-                if sub in vistos:
-                    continue
-                vistos.add(sub)
-                _, filhos = listar(share, sub, variante)
-                fila.append((sub, filhos, prof + 1))
-
-    try:
-        r = S.get(RF_LEGADO, timeout=90)
-        r.raise_for_status()
-        meses = sorted(set(re.findall(r'href="(\d{4}-\d{2})/"', r.text)))
-        if meses:
-            return {"tipo": "http", "pasta": RF_LEGADO.rstrip("/") + "/" + meses[-1], "mes": meses[-1]}
-    except Exception as e:
-        PROBLEMAS.append(f"endereço antigo: {type(e).__name__}")
-    detalhes = "; ".join(PROBLEMAS[:6]) or "sem resposta"
-    raise RuntimeError(f"Não encontrei os arquivos da Receita ({detalhes}).")
+def arquivos_da_tabela(manifesto, tabela):
+    return sorted((f for f in manifesto["files"] if f.get("table") == tabela),
+                  key=lambda f: f["file"])
 
 
-def url_arquivo(fonte, nome):
-    if fonte["tipo"] == "http":
-        return f"{fonte['pasta']}/{nome}", None
-    for variante, url, auth in _variantes(fonte["share"], f"{fonte['pasta']}/{nome}"):
-        if variante == fonte["tipo"]:
-            return url, auth
-
-
-def baixar(fonte, nome):
-    destino = TRAB / nome
-    url, auth = url_arquivo(fonte, nome)
-    tamanho_antes = -1
-    for tentativa in range(1, 11):
+def baixar(repo, info):
+    destino = TRAB / info["file"].split("/")[-1]
+    url = f"{HF_BASE}/{HF_USER}/{repo}/resolve/main/{info['file']}"
+    esperado = int(info.get("bytes") or 0)
+    for tentativa in range(1, 9):
         try:
             feito = destino.stat().st_size if destino.exists() else 0
+            if esperado and feito == esperado:
+                return destino
+            if esperado and feito > esperado:
+                destino.unlink()
+                feito = 0
             cab = {"Range": f"bytes={feito}-"} if feito else {}
-            with S.get(url, auth=auth, headers=cab, stream=True, timeout=180) as r:
-                if r.status_code == 416:
-                    pass
-                else:
-                    r.raise_for_status()
-                    modo = "ab" if (feito and r.status_code == 206) else "wb"
-                    with open(destino, modo) as f:
-                        for bloco in r.iter_content(1 << 20):
-                            f.write(bloco)
-            with zipfile.ZipFile(destino) as z:
-                z.namelist()
-            log(f"  baixado {nome} ({destino.stat().st_size / 1e6:.0f} MB)")
-            return destino
-        except zipfile.BadZipFile:
-            atual = destino.stat().st_size if destino.exists() else 0
-            if atual == tamanho_antes:
-                destino.unlink(missing_ok=True)
-            tamanho_antes = atual
-            log(f"  {nome} incompleto, tentativa {tentativa}")
+            with S.get(url, headers=cab, stream=True, timeout=180) as r:
+                r.raise_for_status()
+                modo = "ab" if (feito and r.status_code == 206) else "wb"
+                with open(destino, modo) as f:
+                    for bloco in r.iter_content(1 << 20):
+                        f.write(bloco)
+            tamanho = destino.stat().st_size
+            if not esperado or tamanho == esperado:
+                log(f"  baixado {destino.name} ({tamanho / 1e6:.0f} MB)")
+                return destino
+            log(f"  {destino.name} incompleto ({tamanho}/{esperado}), tentativa {tentativa}")
         except Exception as e:
-            log(f"  {nome} tentativa {tentativa}: {e}")
-        time.sleep(min(90, 10 * tentativa))
-    raise RuntimeError(f"Não consegui baixar {nome} depois de 10 tentativas.")
+            log(f"  {destino.name} tentativa {tentativa}: {e}")
+        time.sleep(min(60, 5 * tentativa))
+    raise RuntimeError(f"Não consegui baixar {info['file']} depois de 8 tentativas.")
 
 
-def linhas(caminho, basicos=None, pre=None):
-    with zipfile.ZipFile(caminho) as z:
-        for nome in z.namelist():
-            with z.open(nome) as f:
-                for bruta in f:
-                    if basicos is not None and bruta[1:9] not in basicos:
-                        continue
-                    if pre is not None and not pre(bruta):
-                        continue
-                    try:
-                        campos = next(csv.reader([bruta.decode("latin-1")], delimiter=";"))
-                    except Exception:
-                        continue
-                    yield [c.strip() for c in campos]
+def colunas(caminho):
+    return [r[0] for r in CON.execute(f"DESCRIBE SELECT * FROM read_parquet('{caminho}')").fetchall()]
+
+
+def texto(linha):
+    return ["" if v is None else str(v).strip() for v in linha]
+
+
+def ler_tudo(caminho):
+    return [texto(r) for r in CON.execute(f"SELECT * FROM read_parquet('{caminho}')").fetchall()]
+
+
+def ler_estabelecimentos(caminho):
+    c = colunas(caminho)
+    if len(c) < 28:
+        raise RuntimeError(f"Formato inesperado em {caminho.name}: {len(c)} colunas.")
+    uf, cnae, sec, ddd1, ddd2 = (f'"{c[i]}"' for i in (19, 11, 12, 21, 23))
+    lista_cnae = ", ".join(f"'{x}'" for x in CNAES)
+    lista_ddd = ", ".join(f"'{d}'" for d in DDDS)
+    sql = (
+        f"SELECT * FROM read_parquet('{caminho}') "
+        f"WHERE {uf} = '{UF}' "
+        f"AND (ltrim(coalesce({ddd1}, ''), '0') IN ({lista_ddd}) "
+        f"OR ltrim(coalesce({ddd2}, ''), '0') IN ({lista_ddd})) "
+        f"AND ({cnae} IN ({lista_cnae}) OR regexp_matches(coalesce({sec}, ''), '{'|'.join(CNAES)}'))"
+    )
+    return [texto(r) for r in CON.execute(sql).fetchall()]
+
+
+def ler_por_basico(caminho, basicos):
+    c0 = colunas(caminho)[0]
+    CON.execute("CREATE OR REPLACE TEMP TABLE alvo (b VARCHAR)")
+    CON.executemany("INSERT INTO alvo VALUES (?)", [(b,) for b in sorted(basicos)])
+    sql = f'SELECT * FROM read_parquet(\'{caminho}\') WHERE "{c0}" IN (SELECT b FROM alvo)'
+    return [texto(r) for r in CON.execute(sql).fetchall()]
 
 
 # ---------------------------------------------------------------- Formatação
@@ -257,27 +225,29 @@ def nome_limpo(razao):
 # ---------------------------------------------------------------- Coleta
 def coletar():
     TRAB.mkdir(exist_ok=True)
-    fonte = achar_fonte()
-    log(f"Base da Receita: {fonte['mes']} ({fonte['tipo']})")
-    faixa = range(1) if MODO_TESTE else range(10)
+    repo, manifesto = achar_edicao()
+    mes = manifesto.get("month") or repo[-7:]
+    log(f"Base da Receita: {mes} (espelho {HF_USER}/{repo})")
+
+    def partes(tabela):
+        lista = arquivos_da_tabela(manifesto, tabela)
+        if not lista:
+            raise RuntimeError(f"O espelho não tem a tabela {tabela}.")
+        return lista[:1] if MODO_TESTE else lista
 
     municipios = {}
-    z = baixar(fonte, "Municipios.zip")
-    for c in linhas(z):
-        if len(c) >= 2:
-            municipios[c[0]] = c[1].title()
-    z.unlink()
-
-    cnaes_b = [c.encode() for c in CNAES]
-    uf_b = f'"{UF}"'.encode()
-
-    def pre(b):
-        return uf_b in b and any(c in b for c in cnaes_b)
+    for info in partes("municipios"):
+        p = baixar(repo, info)
+        for c in ler_tudo(p):
+            if len(c) >= 2:
+                municipios[c[0]] = c[1].title()
+        p.unlink()
+    log(f"Municípios carregados: {len(municipios)}")
 
     estab = {}
-    for i in faixa:
-        z = baixar(fonte, f"Estabelecimentos{i}.zip")
-        for c in linhas(z, pre=pre):
+    for info in partes("estabelecimentos"):
+        p = baixar(repo, info)
+        for c in ler_estabelecimentos(p):
             if len(c) < 28 or c[19] != UF:
                 continue
             if APENAS_ATIVAS and c[5].lstrip("0") != "2":
@@ -289,24 +259,24 @@ def coletar():
             if not culturas:
                 continue
             estab[c[0] + c[1] + c[2]] = c + [culturas]
-        z.unlink()
-        log(f"Estabelecimentos{i}: {len(estab)} encontrados até agora")
+        p.unlink()
+        log(f"{info['file']}: {len(estab)} encontrados até agora")
 
-    basicos = {k[:8].encode() for k in estab}
+    basicos = {k[:8] for k in estab}
     empresas, socios = {}, defaultdict(list)
     if basicos:
-        for i in faixa:
-            z = baixar(fonte, f"Empresas{i}.zip")
-            for c in linhas(z, basicos=basicos):
+        for info in partes("empresas"):
+            p = baixar(repo, info)
+            for c in ler_por_basico(p, basicos):
                 empresas[c[0]] = c
-            z.unlink()
-        for i in faixa:
-            z = baixar(fonte, f"Socios{i}.zip")
-            for c in linhas(z, basicos=basicos):
+            p.unlink()
+        for info in partes("socios"):
+            p = baixar(repo, info)
+            for c in ler_por_basico(p, basicos):
                 if len(c) > 4 and c[2]:
                     socios[c[0]].append({"n": c[2].title(), "q": QUALIF.get(c[4], "")})
-            z.unlink()
-    return fonte["mes"], montar(estab, empresas, socios, municipios)
+            p.unlink()
+    return mes, montar(estab, empresas, socios, municipios)
 
 
 def montar(estab, empresas, socios, municipios):
