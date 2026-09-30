@@ -1,0 +1,53 @@
+name: Coletar produtores DDD 17
+
+on:
+  workflow_dispatch:
+    inputs:
+      modo_teste:
+        description: "Teste rápido (só uma parte da base)"
+        type: boolean
+        default: true
+  schedule:
+    - cron: "0 12 20 * *"   # todo dia 20, às 9h de Brasília
+
+permissions:
+  contents: write
+
+jobs:
+  coletar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar bibliotecas
+        run: pip install requests openpyxl
+
+      - name: Rodar coleta
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MODO_TESTE: ${{ inputs.modo_teste || 'false' }}
+        run: python coletar.py
+
+      - name: Guardar painel e planilha
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: painel-e-planilha
+          path: saida/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Salvar histórico (para marcar quem é novo)
+        if: success() && inputs.modo_teste != true
+        run: |
+          git config user.name "coleta-bot"
+          git config user.email "coleta-bot@users.noreply.github.com"
+          git add historico/cnpjs.txt
+          git diff --cached --quiet || git commit -m "Atualiza histórico de CNPJs"
+          git push
